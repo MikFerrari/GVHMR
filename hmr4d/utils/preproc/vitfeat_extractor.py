@@ -17,6 +17,14 @@ def get_batch(input_path, bbx_xys, img_ds=0.5, img_dst_size=256, path_type="vide
         imgs = cv2.imread(str(input_path))[..., ::-1]
         imgs = cv2.resize(imgs, (0, 0), fx=img_ds, fy=img_ds)
         imgs = imgs[None]
+    elif path_type == "image_list":
+        assert isinstance(input_path, list)
+        imgs = []
+        for img_path in input_path:
+            img = cv2.imread(str(img_path))[..., ::-1]
+            img = cv2.resize(img, (0, 0), fx=img_ds, fy=img_ds)
+            imgs.append(img)
+        imgs = np.stack(imgs)
     elif path_type == "np":
         assert isinstance(input_path, np.ndarray)
         assert img_ds == 1.0  # this is safe
@@ -77,6 +85,34 @@ class Extractor:
         F, _, H, W = imgs.shape  # (F, 3, H, W)
         imgs = imgs.cuda()
         batch_size = 16  # 5GB GPU memory, occupies all CUDA cores of 3090
+        features = []
+        for j in tqdm(range(0, F, batch_size), desc="HMR2 Feature", leave=self.tqdm_leave):
+            imgs_batch = imgs[j : j + batch_size]
+
+            with torch.no_grad():
+                feature = self.extractor({"img": imgs_batch})
+                features.append(feature.detach().cpu())
+
+        features = torch.cat(features, dim=0).clone()  # (F, 1024)
+        return features
+
+    def extract_frames_features(self, image_paths, bbx_xys, img_ds=0.5):
+        """
+        Extract features from a batch of image frames.
+        Args:
+            image_paths: list of str, paths to images
+            bbx_xys: torch.Tensor or np.ndarray, (N, 3) bounding box info for each image
+            img_ds: float, downscale factor
+        Returns:
+            features: torch.Tensor, (N, 1024)
+        """
+        # Get the batch using get_batch with path_type="image_list"
+        imgs, bbx_xys = get_batch(image_paths, bbx_xys, img_ds=img_ds, path_type="image_list")
+
+        # Inference
+        F, _, H, W = imgs.shape  # (F, 3, H, W)
+        imgs = imgs.cuda()
+        batch_size = 16
         features = []
         for j in tqdm(range(0, F, batch_size), desc="HMR2 Feature", leave=self.tqdm_leave):
             imgs_batch = imgs[j : j + batch_size]

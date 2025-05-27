@@ -19,17 +19,19 @@ ckpt_path: inputs/checkpoints/gvhmr/gvhmr_siga24_release.ckpt
 #          global setting          #
 # ================================ #
 
-video_name: ???
+video_name: buildbot_example_frames
 output_root: outputs/demo
 output_dir: "${output_root}/${video_name}"
 preprocess_dir: ${output_dir}/preprocess
-video_path: "${output_dir}/0_input_video.mp4"
+video_path: "${preprocess_dir}/0_input_video.mp4"
+# frames_path: ???
 
 # Options
 static_cam: False
 verbose: False
 use_dpvo: False
 f_mm: null  # focal length of fullframe camera in mm
+fps: 15
 
 paths:
   bbx: ${preprocess_dir}/bbx.pt

@@ -177,3 +177,7 @@ tensorboard
 
 # glove
 glove
+
+# ADDED
+docs/example_frames
+docs/example_video/buildbot_example.mp4

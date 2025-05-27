@@ -19,7 +19,7 @@ from hmr4d.utils.net_utils import moving_average_smooth
 class Tracker:
     def __init__(self) -> None:
         # https://docs.ultralytics.com/modes/predict/
-        self.yolo = YOLO(PROJ_ROOT / "inputs/checkpoints/yolo/yolov8x.pt")
+        self.yolo = YOLO(PROJ_ROOT / "inputs/checkpoints/yolo/yolov8n.pt") # yolov8x.pt")
 
     def track(self, video_path):
         track_history = []
@@ -43,6 +43,31 @@ class Tracker:
             track_history.append(result_frame)
 
         return track_history
+    
+    def track_image_batch(self, images, stream_mode=False):
+        """
+        Run YOLO detection on a batch of RGB images (list of numpy arrays or torch tensors).
+        Returns a list of lists of dicts: [[{"id": id, "bbx_xyxy": bbx_xyxy}, ...], ...] for each image.
+        """
+        cfg = {
+            "device": "cuda",
+            "conf": 0.5,
+            "classes": 0,  # human
+            "verbose": False,
+            "stream": stream_mode, # False for batch processing, True for frame-by-frame
+        }
+        results = self.yolo.predict(images, **cfg)
+        batch_result_frames = []
+        for result in tqdm(results, total=len(images), desc="YoloV8 BBox Tracking"):
+            result_frame = []
+            if hasattr(result, "boxes") and result.boxes is not None:
+                boxes = result.boxes
+                if boxes.xyxy is not None and len(boxes.xyxy) > 0:
+                    bbx_xyxy = boxes.xyxy.cpu().numpy()  # (N, 4)
+                    track_ids = list(range(len(bbx_xyxy)))
+                    result_frame = [{"id": track_ids[i], "bbx_xyxy": bbx_xyxy[i]} for i in range(len(track_ids))]
+            batch_result_frames.append(result_frame)
+        return batch_result_frames  # one list per image
 
     @staticmethod
     def sort_track_length(track_history, video_path):
@@ -93,3 +118,21 @@ class Tracker:
         bbx_xyxy_one_track = moving_average_smooth(bbx_xyxy_one_track, window_size=5, dim=0)
 
         return bbx_xyxy_one_track
+    
+    def get_one_track_image_batch(self, images, stream_mode=False):
+        """
+        Run YOLO detection on a batch of RGB images and return the largest detected human bounding box for each image.
+        Returns a list of (4,) torch tensors with the bounding box coordinates (xyxy), or None if no detection for that image.
+        """
+        track_histories = self.track_image_batch(images, stream_mode=stream_mode)  # List of [ {id, bbx_xyxy}, ... ] per image
+        results = []
+        for frame in track_histories:
+            if not frame:
+                results.append(None)  # No detection for this image
+                continue
+            bbx_xyxys = np.array([det["bbx_xyxy"] for det in frame])  # (N, 4)
+            areas = (bbx_xyxys[:, 2] - bbx_xyxys[:, 0]) * (bbx_xyxys[:, 3] - bbx_xyxys[:, 1])
+            idx = np.argmax(areas)
+            bbx_xyxy_one_track = torch.tensor(bbx_xyxys[idx])  # (4,)
+            results.append(bbx_xyxy_one_track)
+        return results  # List of torch tensors or None

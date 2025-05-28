@@ -25,12 +25,35 @@ output_dir: "${output_root}/${video_name}"
 preprocess_dir: ${output_dir}/preprocess
 video_path: "${preprocess_dir}/0_input_video.mp4"
 # frames_path: ???
+main_view_cam: 'cam_3'
+reference_object_keypoints_3D: # [meters]
+ - [0.0, 0.0, 0.0]  # the table corners in this case (ordered clockwise from top left)
+ - [1.8, 0.0, 0.0]
+ - [1.8, 1.0, 0.0]
+ - [0.0, 1.0, 0.0]
+reference_object_keypoints: # [pixels]
+# the table corners in this case (ordered clockwise from top left)
+  cam_1:
+    - [133,  30]
+    - [533,  28]
+    - [513, 295]
+    - [155, 298]
+  cam_2:
+    - [309, 278]
+    - [599, 361]
+    - [425, 516]
+    - [130, 337]
+  cam_3:
+    - [581, 263]
+    - [614, 484]
+    - [190, 415]
+    - [350, 257]
 
 # Options
 static_cam: False
 verbose: False
 use_dpvo: False
-f_mm: null  # focal length of fullframe camera in mm
+f_mm: 1.98 #null  # focal length of fullframe camera in mm
 fps: 15
 
 paths:

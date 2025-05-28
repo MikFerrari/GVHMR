@@ -117,6 +117,108 @@ def parse_args_to_cfg():
     return cfg
 
 
+import matplotlib.pyplot as plt
+
+def show_image_matplotlib(img, title="Image", add_border=False):
+    if add_border:
+        # Add a 120-pixel white border to the right and bottom
+        color = [255, 255, 255]  # White in BGR
+        img = cv2.copyMakeBorder(
+            img,
+            top=0, bottom=120,
+            left=0, right=120,
+            borderType=cv2.BORDER_CONSTANT,
+            value=color
+        )
+    # If image is BGR (OpenCV default), convert to RGB
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        img_to_show = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    else:
+        img_to_show = img
+    plt.imshow(img_to_show)
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+
+def load_reference_kpts_from_config(cfg):
+    """
+    Loads reference keypoints for each camera from a YAML config file.
+    The YAML file should have the following structure:
+    reference_object_keypoints:
+      cam_1:
+        - [x1, y1]
+        - [x2, y2]
+        - [x3, y3]
+        - [x4, y4]
+      cam_2:
+        - [x1, y1]
+        - [x2, y2]
+        - [x3, y3]
+        - [x4, y4]
+      ...
+    Returns: dict {cam_name: np.array of shape (4, 2)}
+    """
+    kpts_dict = {}
+    for cam_name, kpts in cfg.reference_object_keypoints.items():
+        kpts_dict[cam_name] = np.array(kpts, dtype=np.int16)
+
+    # Get the 3D reference keypoints in the world coordinate system
+    object_3D_points = np.array(cfg.reference_object_keypoints_3D, dtype=np.float32)
+
+    return kpts_dict, object_3D_points
+
+
+def calibrate_cameras_with_ref_kpts(cfg, debug=False):
+    """
+    Calibrate all cameras with respect to the main_view using 2D keypoints from config and solvePnP.
+    Returns:
+        dict of {cam_name: extrinsic_matrix (4x4 [R|t])} mapping each camera to the world frame
+    """
+    ref_kpts_dict, object_3D_points = load_reference_kpts_from_config(cfg)
+    # Reference all image keypoints to the first value (subtract the first keypoint for each camera)
+    for cam_name, kpts in ref_kpts_dict.items():
+        ref_kpts_dict[cam_name] = kpts - kpts[0]
+    
+    extrinsics = {}
+
+    # Camera intrinsics: estimate from image size or use provided
+    # We'll use the first camera's first image to get width/height
+    first_cam = list(ref_kpts_dict.keys())[0]
+    sample_img_path = sorted((Path(cfg.preprocess_dir) / first_cam).iterdir())[0]
+    sample_img = cv2.imread(str(sample_img_path))
+    height, width = sample_img.shape[:2]
+    
+    if cfg.f_mm is not None:
+        _, _, camera_matrix = create_camera_sensor(width, height, cfg.f_mm)
+        camera_matrix = camera_matrix.cpu().numpy()
+    else:
+        camera_matrix = estimate_K(width, height).cpu().numpy()
+    # camera_matrix[0][0] = 20
+    # camera_matrix[1][1] = 20
+    dist_coeffs = np.zeros((4, 1))  # Assuming no distortion
+
+    for cam_name, keypoints in ref_kpts_dict.items():
+        image_points = np.array(keypoints, dtype=np.float32)
+        
+        # Solve PnP for this camera
+        success, rvec, tvec = cv2.solvePnP(object_3D_points, image_points, camera_matrix, dist_coeffs)
+        if not success:
+            raise RuntimeError(f"PnP failed for {cam_name}")
+        
+        R, _ = cv2.Rodrigues(rvec)
+        extrinsic = np.eye(4)
+        extrinsic[:3, :3] = R
+        extrinsic[:3, 3] = tvec.squeeze()
+        extrinsics[cam_name] = extrinsic
+
+        if debug:
+            print(f"[Calibration] {cam_name} camera INTRINSIC matrix:\n{camera_matrix}")
+            print(f"[Calibration] {cam_name} camera EXTRINSIC matrix:\n{extrinsic} w.r.t. world frame")
+
+    return extrinsics
+
+
 @torch.no_grad()
 def run_preprocess(cfg):
     Log.info(f"[Preprocess] Start!")
@@ -142,7 +244,34 @@ def run_preprocess(cfg):
             ]
             images[cam_name] = cam_images
 
-    
+    # # Display the first image for each camera
+    # for cam_name, cam_images in images.items():
+    #     if cam_images:
+    #         show_image_matplotlib(cam_images[0], title=f"First image: {cam_name}", add_border=True)
+
+    # Calibrate the view cameras using the table corners
+    extrinsics = calibrate_cameras_with_ref_kpts(cfg, debug=verbose)
+
+
+
+
+
+
+
+
+
+TRY ADDING ALSO OTHER REFERENCE POINTS, FOR EXAMPLE THE TIPS OF THE TABLE LEGS
+(BETTER 3D ESTIMATION?)
+
+
+
+
+
+
+
+
+
+    import pdb; pdb.set_trace()
 
     # Get bbx tracking result
     bbx_xys_dict = {}

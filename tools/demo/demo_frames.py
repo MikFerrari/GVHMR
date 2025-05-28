@@ -40,6 +40,7 @@ def parse_args_to_cfg():
     # Put all args to cfg
     parser = argparse.ArgumentParser()
     parser.add_argument("--frames_dir", type=str, required=True, help="Directory containing input frames")
+    parser.add_argument("--video_name", type=str, default="demo", help="Name of the video for output files")
     parser.add_argument("--output_root", type=str, default=None, help="by default to outputs/demo")
     parser.add_argument("-s", "--static_cam", action="store_true", help="If true, skip DPVO")
     parser.add_argument("--use_dpvo", action="store_true", help="If true, use DPVO. By default not using DPVO.")
@@ -57,19 +58,33 @@ def parse_args_to_cfg():
     # Input
     frames_dir = Path(args.frames_dir)
     assert frames_dir.exists() and frames_dir.is_dir(), f"Directory not found: {frames_dir}"
-    # Get all image files (common extensions)
-    frames_paths = sorted([p for p in frames_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
-    assert len(frames_paths) > 0, f"No images found in {frames_dir}"
+
+    # Find all subfolders (each is a camera view)
+    cam_dirs = sorted([d for d in frames_dir.iterdir() if d.is_dir()])
+    assert len(cam_dirs) > 0, f"No camera subfolders found in {frames_dir}"
+
+    # For each camera, get sorted image paths
+    frames_paths_dict = {}
+    for cam_dir in cam_dirs:
+        cam_frames = sorted([p for p in cam_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
+        assert len(cam_frames) > 0, f"No images found in {cam_dir}"
+        frames_paths_dict[cam_dir.name] = cam_frames
+        Log.info(f"[Input Dir]: {cam_dir} ({len(cam_frames)} images)")
+
+    # Optionally: check all cameras have the same number of frames
+    num_frames = [len(paths) for paths in frames_paths_dict.values()]
+    assert len(set(num_frames)) == 1, "All cameras must have the same number of frames (synchronized views)"
+    
     # Assume all images have the same size
-    sample_img = cv2.imread(str(frames_paths[0]))
+    sample_img = cv2.imread(str(frames_paths_dict[cam_dirs[0].name][0]))
     height, width = sample_img.shape[:2]
     Log.info(f"[Input Dir]: {frames_dir}")
-    Log.info(f"(N, W, H) = ({len(frames_paths)}, {width}, {height})")
+    Log.info(f"(N, W, H) = ({len(frames_paths_dict.keys())}, {width}, {height}) | {len(cam_dirs)} cameras")
 
     # Cfg
     with initialize_config_module(version_base="1.3", config_module=f"hmr4d.configs"):
         overrides = [
-            # f"video_name={cfg.video_name}",
+            f"video_name={args.video_name}",
             f"static_cam={args.static_cam}",
             f"verbose={args.verbose}",
             f"use_dpvo={args.use_dpvo}",
@@ -90,15 +105,14 @@ def parse_args_to_cfg():
 
     # Copy raw-input-images to preprocess dir
     Log.info(f"[Copy Images] {frames_dir} -> {cfg.preprocess_dir}")
-    for frame_path in tqdm(frames_paths, desc="Copying images"):
-        out_path = Path(cfg.preprocess_dir) / frame_path.name
-        if not out_path.exists():
-            img = cv2.imread(str(frame_path))
-            cv2.imwrite(str(out_path), img)
-
-    # # Save width and height to cfg for later use
-    # cfg.width = width
-    # cfg.height = height
+    for cam_name, cam_frames in frames_paths_dict.items():
+        cam_out_dir = Path(cfg.preprocess_dir) / cam_name
+        cam_out_dir.mkdir(parents=True, exist_ok=True)
+        for frame_path in tqdm(cam_frames, desc=f"Copying images for {cam_name}"):
+            out_path = cam_out_dir / frame_path.name
+            if not out_path.exists():
+                img = cv2.imread(str(frame_path))
+                cv2.imwrite(str(out_path), img)
 
     return cfg
 
@@ -112,72 +126,105 @@ def run_preprocess(cfg):
     static_cam = cfg.static_cam
     verbose = cfg.verbose
 
+    # Load images as numpy arrays for batch processing
+    images = {}
+    for cam_dir in sorted(Path(frames_path).iterdir()):
+        if cam_dir.is_dir():
+            cam_name = cam_dir.name
+            cam_images = [
+                cv2.imread(str(p))
+                for p in tqdm(
+                    sorted(cam_dir.iterdir()),
+                    desc=f"Loading images for {cam_name}",
+                    total=len([f for f in cam_dir.iterdir() if f.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
+                )
+                if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]
+            ]
+            images[cam_name] = cam_images
+
+    
+
     # Get bbx tracking result
+    bbx_xys_dict = {}
     if not Path(paths.bbx).exists():
         tracker = Tracker()
-        # Load images as numpy arrays for batch processing
-        images = [
-            cv2.imread(str(p))
-            for p in tqdm(
-                sorted(Path(frames_path).iterdir()),
-                desc="Loading images",
-                total=len([f for f in Path(frames_path).iterdir() if f.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
-            )
-            if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]
-        ]
-        bbx_xyxy_list = tracker.get_one_track_image_batch(images, stream_mode=True)  # List of (4,) tensors or None; # False for batch processing, True for frame-by-frame
-        # Replace None with zeros for missing detections to keep tensor shape consistent
-        bbx_xyxy = torch.stack([
-            x if x is not None else torch.zeros(4) for x in bbx_xyxy_list
-        ]).float()  # (L, 4)
-        bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()  # (L, 3)
-        torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
+        for cam_name, cam_images in images.items():
+            bbx_xyxy_list = tracker.get_one_track_image_batch(cam_images, stream_mode=True)
+            # Replace None with zeros for missing detections to keep tensor shape consistent
+            bbx_xyxy = torch.stack([
+                x if x is not None else torch.zeros(4) for x in bbx_xyxy_list
+            ]).float()  # (L, 4)
+            bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()  # (L, 3)
+            # Save per-camera bbx results in the camera's subfolder
+            cam_out_dir = Path(cfg.preprocess_dir) / cam_name
+            cam_out_dir.mkdir(parents=True, exist_ok=True)
+            torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, cam_out_dir / Path(paths.bbx).name)
+            bbx_xys_dict[cam_name] = bbx_xys
         del tracker
     else:
-        bbx_xys = torch.load(paths.bbx)["bbx_xys"]
-        Log.info(f"[Preprocess] bbx (xyxy, xys) from {paths.bbx}")
+        for cam_name in images.keys():
+            cam_out_dir = Path(cfg.preprocess_dir) / cam_name
+            bbx_xys = torch.load(cam_out_dir / Path(paths.bbx).name)["bbx_xys"]
+            bbx_xys_dict[cam_name] = bbx_xys
+            Log.info(f"[Preprocess] bbx (xyxy, xys) from {cam_out_dir / Path(paths.bbx).name}")
     if verbose:
-        # For visualization, reload images and overlay bounding boxes
-        images = [cv2.imread(str(p)) for p in sorted(Path(frames_path).iterdir())
-                  if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
-        bbx_xyxy = torch.load(paths.bbx)["bbx_xyxy"]
-        video_overlay = draw_bbx_xyxy_on_image_batch(bbx_xyxy, images)
-        save_video(video_overlay, cfg.paths.bbx_xyxy_video_overlay)
+        for cam_name, cam_images in images.items():
+            Log.info(f"[Preprocess] Drawing bounding boxes on images for {cam_name}")
+            cam_out_dir = Path(cfg.preprocess_dir) / cam_name
+            bbx_xyxy = torch.load(cam_out_dir / Path(paths.bbx).name)["bbx_xyxy"]
+            video_overlay = draw_bbx_xyxy_on_image_batch(bbx_xyxy, cam_images)
+            save_video(video_overlay, cam_out_dir / Path(cfg.paths.bbx_xyxy_video_overlay).name)
 
-    frames_path_list = [str(p) for p in sorted(Path(frames_path).iterdir())
-                        if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
     # Get VitPose
-    if not Path(paths.vitpose).exists():
-        vitpose_extractor = VitPoseExtractor()
-        vitpose = vitpose_extractor.extract_frames(frames_path_list, bbx_xys)
-        torch.save(vitpose, paths.vitpose)
-        del vitpose_extractor
-    else:
-        vitpose = torch.load(paths.vitpose)
-        Log.info(f"[Preprocess] vitpose from {paths.vitpose}")
-    if verbose:
-        # For visualization, reload images and overlay skeletons
-        images = [cv2.imread(str(p)) for p in sorted(Path(frames_path).iterdir())
-                if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
-        video_overlay = draw_coco17_skeleton_batch(images, vitpose, 0.5)
-        save_video(video_overlay, paths.vitpose_video_overlay)
+    vitpose_dict = {}
+    for cam_name, cam_images in images.items():
+        frames_path_list = [str(p) for p in sorted((Path(frames_path) / cam_name).iterdir())
+                            if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
+        cam_out_dir = Path(cfg.preprocess_dir) / cam_name
+        vitpose_path = cam_out_dir / Path(paths.vitpose).name
+        if not vitpose_path.exists():
+            vitpose_extractor = VitPoseExtractor()
+            vitpose = vitpose_extractor.extract_frames(frames_path_list, bbx_xys_dict[cam_name])
+            torch.save(vitpose, vitpose_path)
+            del vitpose_extractor
+        else:
+            vitpose = torch.load(vitpose_path)
+            Log.info(f"[Preprocess] vitpose from {vitpose_path}")
+        vitpose_dict[cam_name] = vitpose
+        if verbose:
+            Log.info(f"[Preprocess] Drawing vitpose skeletons on images for {cam_name}")
+            video_overlay = draw_coco17_skeleton_batch(cam_images, vitpose, 0.5)
+            save_video(video_overlay, cam_out_dir / Path(paths.vitpose_video_overlay).name)
 
-    # Get vit features
-    if not Path(paths.vit_features).exists():
-        extractor = Extractor()
-        vit_features = extractor.extract_frames_features(frames_path_list, bbx_xys)
-        torch.save(vit_features, paths.vit_features)
-        del extractor
-    else:
-        Log.info(f"[Preprocess] vit_features from {paths.vit_features}")
+    # Get Vit features
+    vit_features_dict = {}
+    for cam_name, cam_images in images.items():
+        frames_path_list = [str(p) for p in sorted((Path(frames_path) / cam_name).iterdir())
+                            if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
+        cam_out_dir = Path(cfg.preprocess_dir) / cam_name
+        vit_features_path = cam_out_dir / Path(paths.vit_features).name
+        if not vit_features_path.exists():
+            extractor = Extractor()
+            vit_features = extractor.extract_frames_features(frames_path_list, bbx_xys_dict[cam_name])
+            torch.save(vit_features, vit_features_path)
+            del extractor
+        else:
+            Log.info(f"[Preprocess] vit_features from {vit_features_path}")
+            vit_features = torch.load(vit_features_path)
+        vit_features_dict[cam_name] = vit_features
 
+    ####### NOT TESTED YET ########
     # Get visual odometry results
     if not static_cam:  # use slam to get cam rotation
-        if not Path(paths.slam).exists():
-            if not cfg.use_dpvo:
-                simple_vo = SimpleVOImages(cfg.preprocess_dir, scale=0.5, step=8, method="sift", f_mm=cfg.f_mm)
-                vo_results = simple_vo.compute()  # (L, 4, 4), numpy
-                torch.save(vo_results, paths.slam)
+        for cam_name, cam_images in images.items():
+            slam_path = Path(paths.slam).with_stem(f"{Path(paths.slam).stem}_{cam_name}")
+            if not slam_path.exists():
+                if not cfg.use_dpvo:
+                    frames_path_list = [str(p) for p in sorted((Path(frames_path) / cam_name).iterdir())
+                                        if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
+                    simple_vo = SimpleVOImages(frames_path_list, scale=0.5, step=8, method="sift", f_mm=cfg.f_mm)
+                    vo_results = simple_vo.compute()  # (L, 4, 4), numpy
+                    torch.save(vo_results, slam_path)
             
             ### NOT ADAPTED TO PROCESSING OF BATCHES OF IMAGES YET ###
             else:  # DPVO
@@ -199,46 +246,95 @@ def run_preprocess(cfg):
             ##########################################################
         else:
             Log.info(f"[Preprocess] slam results from {paths.slam}")
+    #############################
 
     Log.info(f"[Preprocess] End. Time elapsed: {Log.time()-tic:.2f}s")
 
 
 def load_data_dict(cfg, video_mode=True):
+    """
+    Loads data for single or multi-camera setups.
+    If multi-camera, returns a dict of data per camera.
+    """
     paths = cfg.paths
-    
-    if video_mode:
-        length, width, height = get_video_lwh(cfg.video_path)
-    else:
-        # For image batch processing, get the list of frames and their dimensions
-        frames_paths = sorted([p for p in Path(cfg.preprocess_dir).iterdir()
-                               if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
-        length = len(frames_paths)
-        sample_img = cv2.imread(str(frames_paths[0]))
-        height, width = sample_img.shape[:2]
-    
-    if cfg.static_cam:
-        R_w2c = torch.eye(3).repeat(length, 1, 1)
-    else:
-        traj = torch.load(cfg.paths.slam)
-        if cfg.use_dpvo:  # DPVO
-            traj_quat = torch.from_numpy(traj[:, [6, 3, 4, 5]])
-            R_w2c = quaternion_to_matrix(traj_quat).mT
-        else:  # SimpleVO
-            R_w2c = torch.from_numpy(traj[:, :3, :3])
-    if cfg.f_mm is not None:
-        K_fullimg = create_camera_sensor(width, height, cfg.f_mm)[2].repeat(length, 1, 1)
-    else:
-        K_fullimg = estimate_K(width, height).repeat(length, 1, 1)
 
-    data = {
-        "length": torch.tensor(length),
-        "bbx_xys": torch.load(paths.bbx)["bbx_xys"],
-        "kp2d": torch.load(paths.vitpose),
-        "K_fullimg": K_fullimg,
-        "cam_angvel": compute_cam_angvel(R_w2c),
-        "f_imgseq": torch.load(paths.vit_features),
-    }
-    return data
+    # Detect multi-camera setup by checking for subfolders in preprocess_dir
+    cam_dirs = sorted([d for d in Path(cfg.preprocess_dir).iterdir() if d.is_dir()])
+    is_multicam = len(cam_dirs) > 0
+
+    if is_multicam:
+        data_dict = {}
+        for cam_dir in cam_dirs:
+            cam_name = cam_dir.name
+            frames_paths = sorted([p for p in cam_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
+            length = len(frames_paths)
+            sample_img = cv2.imread(str(frames_paths[0]))
+            height, width = sample_img.shape[:2]
+
+            # All per-camera files are now in their own subfolder
+            bbx_path = cam_dir / Path(paths.bbx).name
+            vitpose_path = cam_dir / Path(paths.vitpose).name
+            vit_features_path = cam_dir / Path(paths.vit_features).name
+            slam_path = cam_dir / Path(paths.slam).name
+
+            if cfg.static_cam:
+                R_w2c = torch.eye(3).repeat(length, 1, 1)
+            else:
+                traj = torch.load(slam_path)
+                if cfg.use_dpvo:  # DPVO
+                    traj_quat = torch.from_numpy(traj[:, [6, 3, 4, 5]])
+                    R_w2c = quaternion_to_matrix(traj_quat).mT
+                else:  # SimpleVO
+                    R_w2c = torch.from_numpy(traj[:, :3, :3])
+            if cfg.f_mm is not None:
+                K_fullimg = create_camera_sensor(width, height, cfg.f_mm)[2].repeat(length, 1, 1)
+            else:
+                K_fullimg = estimate_K(width, height).repeat(length, 1, 1)
+
+            data = {
+                "length": torch.tensor(length),
+                "bbx_xys": torch.load(bbx_path)["bbx_xys"],
+                "kp2d": torch.load(vitpose_path),
+                "K_fullimg": K_fullimg,
+                "cam_angvel": compute_cam_angvel(R_w2c),
+                "f_imgseq": torch.load(vit_features_path),
+            }
+            data_dict[cam_name] = data
+        return data_dict
+    else:
+        # Single camera or flat folder
+        if video_mode:
+            length, width, height = get_video_lwh(cfg.video_path)
+        else:
+            frames_paths = sorted([p for p in Path(cfg.preprocess_dir).iterdir()
+                                   if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
+            length = len(frames_paths)
+            sample_img = cv2.imread(str(frames_paths[0]))
+            height, width = sample_img.shape[:2]
+
+        if cfg.static_cam:
+            R_w2c = torch.eye(3).repeat(length, 1, 1)
+        else:
+            traj = torch.load(cfg.paths.slam)
+            if cfg.use_dpvo:  # DPVO
+                traj_quat = torch.from_numpy(traj[:, [6, 3, 4, 5]])
+                R_w2c = quaternion_to_matrix(traj_quat).mT
+            else:  # SimpleVO
+                R_w2c = torch.from_numpy(traj[:, :3, :3])
+        if cfg.f_mm is not None:
+            K_fullimg = create_camera_sensor(width, height, cfg.f_mm)[2].repeat(length, 1, 1)
+        else:
+            K_fullimg = estimate_K(width, height).repeat(length, 1, 1)
+
+        data = {
+            "length": torch.tensor(length),
+            "bbx_xys": torch.load(paths.bbx)["bbx_xys"],
+            "kp2d": torch.load(paths.vitpose),
+            "K_fullimg": K_fullimg,
+            "cam_angvel": compute_cam_angvel(R_w2c),
+            "f_imgseq": torch.load(paths.vit_features),
+        }
+        return data
 
 
 def create_video_from_frames(frames_dir, video_path, fps=30):
@@ -371,22 +467,59 @@ if __name__ == "__main__":
     run_preprocess(cfg)
     data = load_data_dict(cfg, video_mode=False)  # False for image batch processing
 
-    # ===== HMR4D ===== #
-    if not Path(paths.hmr4d_results).exists():
-        Log.info("[HMR4D] Predicting")
-        model: DemoPL = hydra.utils.instantiate(cfg.model, _recursive_=False)
-        model.load_pretrained_model(cfg.ckpt_path)
-        model = model.eval().cuda()
-        tic = Log.sync_time()
-        pred = model.predict(data, static_cam=cfg.static_cam)
-        pred = detach_to_cpu(pred)
-        data_time = data["length"] / 30
-        Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
-        torch.save(pred, paths.hmr4d_results)
+    # ===== HMR4D & Rendering for Multi-Camera ===== #
+    if isinstance(data, dict):  # Multi-camera setup
+        for cam_name, cam_data in data.items():
+            # HMR4D results path for this camera
+            hmr4d_result_path = Path(paths.hmr4d_results).with_stem(f"{Path(paths.hmr4d_results).stem}_{cam_name}")
+            if not hmr4d_result_path.exists():
+                Log.info(f"[HMR4D] Predicting for {cam_name}")
+                model: DemoPL = hydra.utils.instantiate(cfg.model, _recursive_=False)
+                model.load_pretrained_model(cfg.ckpt_path)
+                model = model.eval().cuda()
+                tic = Log.sync_time()
+                pred = model.predict(cam_data, static_cam=cfg.static_cam)
+                pred = detach_to_cpu(pred)
+                data_time = cam_data["length"] / 30
+                Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
+                torch.save(pred, hmr4d_result_path)
 
-    # ===== Render ===== #
-    render_incam(cfg)
-    render_global(cfg)
-    if not Path(paths.incam_global_horiz_video).exists():
-        Log.info("[Merge Videos]")
-        merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+            # ===== Render for this camera ===== #
+            incam_video_path = Path(paths.incam_video).with_stem(f"{Path(paths.incam_video).stem}_{cam_name}")
+            global_video_path = Path(paths.global_video).with_stem(f"{Path(paths.global_video).stem}_{cam_name}")
+            incam_global_horiz_video = Path(paths.incam_global_horiz_video).with_stem(f"{Path(paths.incam_global_horiz_video).stem}_{cam_name}")
+
+            # Update cfg for this camera's outputs
+            cfg_cam = cfg.copy()
+            cfg_cam.preprocess_dir = str(Path(cfg.preprocess_dir) / cam_name)
+            cfg_cam.paths.hmr4d_results = str(hmr4d_result_path)
+            cfg_cam.paths.incam_video = str(incam_video_path)
+            cfg_cam.paths.global_video = str(global_video_path)
+            cfg_cam.paths.incam_global_horiz_video = str(incam_global_horiz_video)
+            cfg_cam.video_path = str(Path(cfg.video_path).with_stem(f"{Path(cfg.video_path).stem}_{cam_name}"))
+
+            render_incam(cfg_cam)
+            render_global(cfg_cam)
+            if not Path(cfg_cam.paths.incam_global_horiz_video).exists():
+                Log.info(f"[Merge Videos] for {cam_name}")
+                merge_videos_horizontal([cfg_cam.paths.incam_video, cfg_cam.paths.global_video], cfg_cam.paths.incam_global_horiz_video)
+    else:
+        # Single camera or flat folder
+        if not Path(paths.hmr4d_results).exists():
+            Log.info("[HMR4D] Predicting")
+            model: DemoPL = hydra.utils.instantiate(cfg.model, _recursive_=False)
+            model.load_pretrained_model(cfg.ckpt_path)
+            model = model.eval().cuda()
+            tic = Log.sync_time()
+            pred = model.predict(data, static_cam=cfg.static_cam)
+            pred = detach_to_cpu(pred)
+            data_time = data["length"] / 30
+            Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
+            torch.save(pred, paths.hmr4d_results)
+
+        # ===== Render ===== #
+        render_incam(cfg)
+        render_global(cfg)
+        if not Path(paths.incam_global_horiz_video).exists():
+            Log.info("[Merge Videos]")
+            merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)

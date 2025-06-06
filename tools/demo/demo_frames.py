@@ -32,6 +32,9 @@ from tqdm import tqdm
 from hmr4d.utils.geo_transform import apply_T_on_points, compute_T_ayfz2ay
 from einops import einsum, rearrange
 
+from camera_calibration_utils import *
+import matplotlib.pyplot as plt
+
 
 CRF = 23  # 17 is lossless, every +6 halves the mp4 size
 
@@ -114,109 +117,153 @@ def parse_args_to_cfg():
                 img = cv2.imread(str(frame_path))
                 cv2.imwrite(str(out_path), img)
 
+    # Copy calibration points to preprocess dir
+    Log.info(f"[Copy Calibration Points] {frames_dir} -> {cfg.preprocess_dir}")
+    copy_calibration_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.calibration_filename)
+    copy_calibration_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.calibration_valid_filename)
+    copy_calibration_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.reference_object_kpts_filename)
+    copy_calibration_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.bundle_adjustment_filename)
+
     return cfg
 
 
-import matplotlib.pyplot as plt
-
-def show_image_matplotlib(img, title="Image", add_border=False):
-    if add_border:
-        # Add a 120-pixel white border to the right and bottom
-        color = [255, 255, 255]  # White in BGR
-        img = cv2.copyMakeBorder(
-            img,
-            top=0, bottom=120,
-            left=0, right=120,
-            borderType=cv2.BORDER_CONSTANT,
-            value=color
-        )
-    # If image is BGR (OpenCV default), convert to RGB
-    if len(img.shape) == 3 and img.shape[2] == 3:
-        img_to_show = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+def copy_calibration_csv_to_preprocess(frames_dir, preprocess_dir, csv_filename):
+    """
+    Copy a calibration CSV file from frames_dir to preprocess_dir if it exists and not already copied.
+    """
+    calibration_csv_path = Path(frames_dir) / csv_filename
+    out_calibration_csv_path = Path(preprocess_dir) / csv_filename
+    if calibration_csv_path.exists():
+        if not out_calibration_csv_path.exists():
+            Log.info(f"Copying calibration points from {calibration_csv_path} to {out_calibration_csv_path}")
+            df = pd.read_csv(calibration_csv_path)
+            df.to_csv(out_calibration_csv_path, index=False)
     else:
-        img_to_show = img
-    plt.imshow(img_to_show)
-    plt.title(title)
-    plt.axis('off')
-    plt.show()
+        Log.error(f"Calibration CSV file not found: {calibration_csv_path}. ")
 
 
-def load_reference_kpts_from_config(cfg):
-    """
-    Loads reference keypoints for each camera from a YAML config file.
-    The YAML file should have the following structure:
-    reference_object_keypoints:
-      cam_1:
-        - [x1, y1]
-        - [x2, y2]
-        - [x3, y3]
-        - [x4, y4]
-      cam_2:
-        - [x1, y1]
-        - [x2, y2]
-        - [x3, y3]
-        - [x4, y4]
-      ...
-    Returns: dict {cam_name: np.array of shape (4, 2)}
-    """
-    kpts_dict = {}
-    for cam_name, kpts in cfg.reference_object_keypoints.items():
-        kpts_dict[cam_name] = np.array(kpts, dtype=np.int16)
-
-    # Get the 3D reference keypoints in the world coordinate system
-    object_3D_points = np.array(cfg.reference_object_keypoints_3D, dtype=np.float32)
-
-    return kpts_dict, object_3D_points
-
-
-def calibrate_cameras_with_ref_kpts(cfg, debug=False):
-    """
-    Calibrate all cameras with respect to the main_view using 2D keypoints from config and solvePnP.
-    Returns:
-        dict of {cam_name: extrinsic_matrix (4x4 [R|t])} mapping each camera to the world frame
-    """
-    ref_kpts_dict, object_3D_points = load_reference_kpts_from_config(cfg)
-    # Reference all image keypoints to the first value (subtract the first keypoint for each camera)
-    for cam_name, kpts in ref_kpts_dict.items():
-        ref_kpts_dict[cam_name] = kpts - kpts[0]
+@torch.no_grad()
+def calibrate_cameras(cfg):
+    # Check if camera extrinsics already exist
+    if Path(cfg.paths.extrinsics).exists() and Path(cfg.paths.intrinsics).exists():
+        Log.info(f"[Calibration] Camera extrinsics already exist at {cfg.paths.extrinsics}.")
+        Log.info(f"[Calibration] Camera extrinsics already exist at {cfg.paths.intrinsics}.")
+        Log.info(f"[Calibration] Skipping calibration step.")
+        return
     
-    extrinsics = {}
+    Log.info(f"[Calibration] Start!")
+    verbose = cfg.verbose
 
-    # Camera intrinsics: estimate from image size or use provided
+    # Load reference keypoints (scene peculiar points) and extract unique values across cameras
+    ref_kpts_2D_dict, ref_kpts_3D_dict = load_calibration_points_from_csv(
+        cfg.preprocess_dir,
+        csv_filename=cfg.reference_object_kpts_filename,
+    )
+    ref_3D_kpts = np.vstack(list(ref_kpts_3D_dict.values()))
+    _, ref_3D_kpts_idx = np.unique(ref_3D_kpts, axis=0, return_index=True)
+    ref_3D_kpts = ref_3D_kpts[sorted(ref_3D_kpts_idx)]
+
+    # Load calibration points (train and test)
+    calib_kpts_2D_dict, calib_kpts_3D_dict = load_calibration_points_from_csv(
+        cfg.preprocess_dir,
+        csv_filename=cfg.calibration_filename,
+    )
+    calib_valid_kpts_2D_dict, calib_valid_kpts_3D_dict = load_calibration_points_from_csv(
+        cfg.preprocess_dir,
+        csv_filename=cfg.calibration_valid_filename,
+    )
+
+    if cfg.augment_calib_with_ref_kpts:
+        Log.info(f"[Calibration] Augmenting calibration keypoints with reference keypoints.")
+        # Concatenate reference keypoints with calibration keypoints
+        for cam in calib_kpts_2D_dict:
+            if cam in ref_kpts_2D_dict:
+                calib_kpts_2D_dict[cam] = np.concatenate([calib_kpts_2D_dict[cam], ref_kpts_2D_dict[cam]], axis=0)
+                calib_kpts_3D_dict[cam] = np.concatenate([calib_kpts_3D_dict[cam], ref_kpts_3D_dict[cam]], axis=0)
+            else:
+                Log.warning(f"[Calibration] Reference keypoints for camera {cam} not found. Skipping augmentation.")
+
+    # Load calibration points for bundle adjustment
+    bundleAdj_kpts_2D_dict, bundleAdj_kpts_3D_dict = load_calibration_points_from_csv(
+        cfg.preprocess_dir,
+        csv_filename=cfg.bundle_adjustment_filename,
+    )
+    bundleAdj_3D_kpts = np.vstack(list(bundleAdj_kpts_3D_dict.values()))
+    _, bundleAdj_3D_kpts_idx = np.unique(bundleAdj_3D_kpts, axis=0, return_index=True)
+    bundleAdj_3D_kpts = bundleAdj_3D_kpts[sorted(bundleAdj_3D_kpts_idx)]
+
     # We'll use the first camera's first image to get width/height
-    first_cam = list(ref_kpts_dict.keys())[0]
+    first_cam = list(ref_kpts_2D_dict.keys())[0]
     sample_img_path = sorted((Path(cfg.preprocess_dir) / first_cam).iterdir())[0]
     sample_img = cv2.imread(str(sample_img_path))
     height, width = sample_img.shape[:2]
-    
+
+    # Camera intrinsics: estimate from image size or use provided
+    # !!! We are assuming all cameras have the same intrinsic parameters !!!
     if cfg.f_mm is not None:
         _, _, camera_matrix = create_camera_sensor(width, height, cfg.f_mm)
         camera_matrix = camera_matrix.cpu().numpy()
     else:
         camera_matrix = estimate_K(width, height).cpu().numpy()
-    # camera_matrix[0][0] = 20
-    # camera_matrix[1][1] = 20
+
     dist_coeffs = np.zeros((4, 1))  # Assuming no distortion
 
-    for cam_name, keypoints in ref_kpts_dict.items():
-        image_points = np.array(keypoints, dtype=np.float32)
-        
-        # Solve PnP for this camera
-        success, rvec, tvec = cv2.solvePnP(object_3D_points, image_points, camera_matrix, dist_coeffs)
-        if not success:
-            raise RuntimeError(f"PnP failed for {cam_name}")
-        
-        R, _ = cv2.Rodrigues(rvec)
-        extrinsic = np.eye(4)
-        extrinsic[:3, :3] = R
-        extrinsic[:3, 3] = tvec.squeeze()
-        extrinsics[cam_name] = extrinsic
+    # Calibrate the view cameras using calibration keypoints
+    extrinsics = calibrate_cameras_with_ref_kpts(
+        calib_kpts_2D_dict, 
+        calib_kpts_3D_dict,
+        camera_matrix,
+        dist_coeffs,
+        debug=verbose
+    )
 
-        if debug:
-            print(f"[Calibration] {cam_name} camera INTRINSIC matrix:\n{camera_matrix}")
-            print(f"[Calibration] {cam_name} camera EXTRINSIC matrix:\n{extrinsic} w.r.t. world frame")
+    if verbose:
+        # Plot the initial calibration scene
+        Log.info(f"[Calibration] Plotting initial calibration scene and validating calibration results.")
+        validate_and_plot_calibration_scene(
+            extrinsics,
+            camera_matrix,
+            ref_3D_kpts,
+            calib_kpts_3D_dict,
+            calib_kpts_2D_dict,
+            ref_kpts_3D_dict, #calib_valid_kpts_3D_dict,
+            ref_kpts_2D_dict, #calib_valid_kpts_2D_dict,
+            connect_indices=[0,1,2,3],  # Connect the corners of the table
+        )
 
-    return extrinsics
+    # Perform bundle adjustment to refine the camera extrinsics
+    if cfg.perform_bundle_adjustment:
+        Log.info(f"[Calibration] Improving camera extrinsics with bundle adjustment.")
+        extrinsics, result = bundle_adjustment(
+            bundleAdj_3D_kpts,
+            bundleAdj_kpts_2D_dict,
+            camera_matrix,
+            extrinsics,
+            return_optimized_points=False,
+            verbose=verbose,
+        )
+        if verbose:
+            Log.info(f"[Calibration] Bundle adjustment optimization result: {result}")
+
+        if verbose:
+            # Plot the optimized calibration scene
+            Log.info(f"[Calibration] Plotting optimized calibration scene and validating calibration results.")
+            validate_and_plot_calibration_scene(
+                extrinsics,
+                camera_matrix,
+                ref_3D_kpts,
+                calib_kpts_3D_dict,
+                calib_kpts_2D_dict,
+                calib_valid_kpts_3D_dict,
+                calib_valid_kpts_2D_dict,
+                connect_indices=[0,1,2,3],  # Connect the corners of the table
+            )
+    
+    # Save the extrinsics and the extrinsics    
+    torch.save(extrinsics, Path(cfg.paths.extrinsics))
+    torch.save(camera_matrix, Path(cfg.paths.intrinsics))
+    Log.info(f"[Calibration] Camera intrinsics saved to {cfg.paths.intrinsics}")
+    Log.info(f"[Calibration] Camera extrinsics saved to {cfg.paths.extrinsics}")
 
 
 @torch.no_grad()
@@ -230,54 +277,28 @@ def run_preprocess(cfg):
 
     # Load images as numpy arrays for batch processing
     images = {}
+    frames_path_list = {}
+    start_idx = getattr(cfg, "start_idx_images_to_load", 0)
+    end_idx = getattr(cfg, "end_idx_images_to_load", None)  # None means load until the end
     for cam_dir in sorted(Path(frames_path).iterdir()):
         if cam_dir.is_dir():
             cam_name = cam_dir.name
+            frame_paths = sorted([p for p in cam_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
+            frame_paths = frame_paths[start_idx:end_idx]
             cam_images = [
                 cv2.imread(str(p))
-                for p in tqdm(
-                    sorted(cam_dir.iterdir()),
-                    desc=f"Loading images for {cam_name}",
-                    total=len([f for f in cam_dir.iterdir() if f.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
-                )
-                if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]
+                for p in tqdm(frame_paths, desc=f"Loading images for {cam_name}")
             ]
             images[cam_name] = cam_images
-
-    # # Display the first image for each camera
-    # for cam_name, cam_images in images.items():
-    #     if cam_images:
-    #         show_image_matplotlib(cam_images[0], title=f"First image: {cam_name}", add_border=True)
-
-    # Calibrate the view cameras using the table corners
-    extrinsics = calibrate_cameras_with_ref_kpts(cfg, debug=verbose)
-
-
-
-
-
-
-
-
-
-TRY ADDING ALSO OTHER REFERENCE POINTS, FOR EXAMPLE THE TIPS OF THE TABLE LEGS
-(BETTER 3D ESTIMATION?)
-
-
-
-
-
-
-
-
-
-    import pdb; pdb.set_trace()
+            frames_path_list[cam_name] = frame_paths
 
     # Get bbx tracking result
     bbx_xys_dict = {}
-    if not Path(paths.bbx).exists():
-        tracker = Tracker()
-        for cam_name, cam_images in images.items():
+    for cam_name, cam_images in images.items():
+        cam_out_dir = Path(cfg.preprocess_dir) / cam_name
+        bbx_path = cam_out_dir / Path(paths.bbx).name
+        if not bbx_path.exists():
+            tracker = Tracker()
             bbx_xyxy_list = tracker.get_one_track_image_batch(cam_images, stream_mode=True)
             # Replace None with zeros for missing detections to keep tensor shape consistent
             bbx_xyxy = torch.stack([
@@ -289,15 +310,13 @@ TRY ADDING ALSO OTHER REFERENCE POINTS, FOR EXAMPLE THE TIPS OF THE TABLE LEGS
             cam_out_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, cam_out_dir / Path(paths.bbx).name)
             bbx_xys_dict[cam_name] = bbx_xys
-        del tracker
-    else:
-        for cam_name in images.keys():
+            del tracker
+        else:
             cam_out_dir = Path(cfg.preprocess_dir) / cam_name
             bbx_xys = torch.load(cam_out_dir / Path(paths.bbx).name)["bbx_xys"]
             bbx_xys_dict[cam_name] = bbx_xys
             Log.info(f"[Preprocess] bbx (xyxy, xys) from {cam_out_dir / Path(paths.bbx).name}")
-    if verbose:
-        for cam_name, cam_images in images.items():
+        if verbose:
             Log.info(f"[Preprocess] Drawing bounding boxes on images for {cam_name}")
             cam_out_dir = Path(cfg.preprocess_dir) / cam_name
             bbx_xyxy = torch.load(cam_out_dir / Path(paths.bbx).name)["bbx_xyxy"]
@@ -307,13 +326,11 @@ TRY ADDING ALSO OTHER REFERENCE POINTS, FOR EXAMPLE THE TIPS OF THE TABLE LEGS
     # Get VitPose
     vitpose_dict = {}
     for cam_name, cam_images in images.items():
-        frames_path_list = [str(p) for p in sorted((Path(frames_path) / cam_name).iterdir())
-                            if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
         cam_out_dir = Path(cfg.preprocess_dir) / cam_name
         vitpose_path = cam_out_dir / Path(paths.vitpose).name
         if not vitpose_path.exists():
             vitpose_extractor = VitPoseExtractor()
-            vitpose = vitpose_extractor.extract_frames(frames_path_list, bbx_xys_dict[cam_name])
+            vitpose = vitpose_extractor.extract_frames(frames_path_list[cam_name], bbx_xys_dict[cam_name])
             torch.save(vitpose, vitpose_path)
             del vitpose_extractor
         else:
@@ -328,13 +345,11 @@ TRY ADDING ALSO OTHER REFERENCE POINTS, FOR EXAMPLE THE TIPS OF THE TABLE LEGS
     # Get Vit features
     vit_features_dict = {}
     for cam_name, cam_images in images.items():
-        frames_path_list = [str(p) for p in sorted((Path(frames_path) / cam_name).iterdir())
-                            if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
         cam_out_dir = Path(cfg.preprocess_dir) / cam_name
         vit_features_path = cam_out_dir / Path(paths.vit_features).name
         if not vit_features_path.exists():
             extractor = Extractor()
-            vit_features = extractor.extract_frames_features(frames_path_list, bbx_xys_dict[cam_name])
+            vit_features = extractor.extract_frames_features(frames_path_list[cam_name], bbx_xys_dict[cam_name])
             torch.save(vit_features, vit_features_path)
             del extractor
         else:
@@ -386,6 +401,8 @@ def load_data_dict(cfg, video_mode=True):
     If multi-camera, returns a dict of data per camera.
     """
     paths = cfg.paths
+    start_idx = getattr(cfg, "start_idx_images_to_load", 0)
+    end_idx = getattr(cfg, "end_idx_images_to_load", None)  # None means load until the end
 
     # Detect multi-camera setup by checking for subfolders in preprocess_dir
     cam_dirs = sorted([d for d in Path(cfg.preprocess_dir).iterdir() if d.is_dir()])
@@ -396,6 +413,7 @@ def load_data_dict(cfg, video_mode=True):
         for cam_dir in cam_dirs:
             cam_name = cam_dir.name
             frames_paths = sorted([p for p in cam_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
+            frames_paths = frames_paths[start_idx:end_idx]
             length = len(frames_paths)
             sample_img = cv2.imread(str(frames_paths[0]))
             height, width = sample_img.shape[:2]
@@ -415,6 +433,11 @@ def load_data_dict(cfg, video_mode=True):
                     R_w2c = quaternion_to_matrix(traj_quat).mT
                 else:  # SimpleVO
                     R_w2c = torch.from_numpy(traj[:, :3, :3])
+
+            # Load the cameras extrinsics and use them to reference all cameras to the world frame
+            extrinsics = torch.load(cfg.paths.extrinsics)
+            T_w2c = torch.from_numpy(extrinsics[cam_name]).float() if cam_name in extrinsics else None
+
             if cfg.f_mm is not None:
                 K_fullimg = create_camera_sensor(width, height, cfg.f_mm)[2].repeat(length, 1, 1)
             else:
@@ -427,8 +450,10 @@ def load_data_dict(cfg, video_mode=True):
                 "K_fullimg": K_fullimg,
                 "cam_angvel": compute_cam_angvel(R_w2c),
                 "f_imgseq": torch.load(vit_features_path),
+                "cam_extrinsics": T_w2c,
             }
             data_dict[cam_name] = data
+
         return data_dict
     else:
         # Single camera or flat folder
@@ -466,8 +491,9 @@ def load_data_dict(cfg, video_mode=True):
         return data
 
 
-def create_video_from_frames(frames_dir, video_path, fps=30):
+def create_video_from_frames(frames_dir, video_path, start_idx, end_idx, fps=30):
     frames_paths = sorted([p for p in Path(frames_dir).iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
+    frames_paths = frames_paths[start_idx:end_idx]
     if not frames_paths:
         raise ValueError(f"No frames found in {frames_dir}")
     # Read first frame to get size
@@ -499,8 +525,20 @@ def render_incam(cfg):
 
     # -- rendering code -- #
     video_path = cfg.video_path
-    if not Path(cfg.video_path).exists():
-        width, height = create_video_from_frames(cfg.preprocess_dir, cfg.video_path, fps=cfg.fps)
+    if not Path(video_path).exists():
+        Log.info(f"[Render Incam] Creating video from frames in {cfg.preprocess_dir}")
+        start_idx = getattr(cfg, "start_idx_images_to_load", 0)
+        end_idx = getattr(cfg, "end_idx_images_to_load", None)  # None means load until the end
+        width, height = create_video_from_frames(
+            cfg.preprocess_dir,
+            video_path,
+            start_idx,
+            end_idx,
+            fps=cfg.fps
+        )
+    else:
+        Log.info(f"[Render Incam] Using existing video {video_path}")
+        _, width, height = get_video_lwh(video_path)
     K = pred["K_fullimg"][0]
 
     # renderer
@@ -514,11 +552,11 @@ def render_incam(cfg):
     for i, img_raw in tqdm(enumerate(reader), total=get_video_lwh(video_path)[0], desc=f"Rendering Incam"):
         img = renderer.render_mesh(verts_incam[i].cuda(), img_raw, [0.8, 0.8, 0.8])
 
-        # # bbx
-        # bbx_xys_ = bbx_xys_render[i].cpu().numpy()
-        # lu_point = (bbx_xys_[:2] - bbx_xys_[2:] / 2).astype(int)
-        # rd_point = (bbx_xys_[:2] + bbx_xys_[2:] / 2).astype(int)
-        # img = cv2.rectangle(img, lu_point, rd_point, (255, 178, 102), 2)
+        # bbx
+        bbx_xys_ = bbx_xys_render[i].cpu().numpy()
+        lu_point = (bbx_xys_[:2] - bbx_xys_[2:] / 2).astype(int)
+        rd_point = (bbx_xys_[:2] + bbx_xys_[2:] / 2).astype(int)
+        img = cv2.rectangle(img, lu_point, rd_point, (255, 178, 102), 2)
 
         writer.write_frame(img)
     writer.close()
@@ -586,11 +624,228 @@ def render_global(cfg):
     writer.close()
 
 
+def render_global_multicam(cfg, cam_name):
+    """
+    Render the predicted vertices in the world (global) frame for a given camera,
+    using the inverse of the extrinsics to transform from camera-global to world-global.
+    Visualizes the coordinate axes at the world origin.
+    """
+    global_video_path = Path(cfg.paths.global_video)
+    if global_video_path.exists():
+        Log.info(f"[Render Global] Video already exists at {global_video_path}")
+        return
+
+    debug_cam = False
+    pred = torch.load(cfg.paths.hmr4d_results)
+    smplx = make_smplx("supermotion").cuda()
+    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
+    faces_smpl = make_smplx("smpl").faces
+    J_regressor = torch.load("hmr4d/utils/body_model/smpl_neutral_J_regressor.pt").cuda()
+
+    # Get the predicted SMPLX parameters in the CAMERA-GLOBAL frame
+    pred_incam = pred["smpl_params_incam"]
+
+    # root_transl_incam = pred_incam["transl"]        # (batch_size, 3)  ([x,y,z] in camera coordinates)
+    # root_orient_incam = pred_incam["global_orient"] # (batch_size, 3)  (Rodrigues vector for rotation)
+    # body_pose_incam = pred_incam["body_pose"]       # (batch_size, 63) (Rodrigues vectors for 21 body joints)
+    # betas_incam = pred_incam["betas"]               # (batch_size, 10) (shape parameters)
+
+    # smpl
+    smplx_out = smplx(**to_cuda(pred_incam))
+    verts_incam = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in smplx_out.vertices])  # (L, V, 3)
+    joints_incam = einsum(J_regressor, verts_incam, "j v, l v i -> l j i")  # (L, J, 3)
+    joints_incam = smplx_out.joints  # (L, J, 3) - this is the same as above
+    assert np.allclose(joints_incam.cpu().numpy(), joints_incam.cpu().numpy()), "Joints mismatch!"
+
+    # --- Transform pred_verts and pred_joints from camera-global to WORLD-GLOBAL frame using extrinsics ---
+    extrinsics = torch.load(cfg.paths.extrinsics)
+    if cam_name not in extrinsics:
+        raise ValueError(f"Camera {cam_name} not found in extrinsics. Available cameras: {list(extrinsics.keys())}")
+    T_w2c = extrinsics[cam_name]  # (4, 4) numpy array
+    T_c2w = np.linalg.inv(T_w2c)  # (4, 4) numpy array
+
+    # Ensure T_c2w is a torch tensor
+    if not torch.is_tensor(T_c2w):
+        T_c2w = torch.from_numpy(T_c2w).to(verts_incam.device).float()
+
+    # Convert verts and joints to torch tensors for transformation
+    pred_verts_torch = verts_incam.detach()  # (L, V, 3)
+    pred_joints_torch = joints_incam.detach()  # (L, J, 3)
+
+    # Add a homogeneous coordinate for transformation
+    verts_incam_h = torch.cat(
+        [
+            pred_verts_torch,
+            torch.ones(pred_verts_torch.shape[0], pred_verts_torch.shape[1], 1,
+                       device=pred_verts_torch.device, dtype=pred_verts_torch.dtype)
+        ],
+        dim=-1
+    )  # (L, V, 4)
+    joints_incam_h = torch.cat(
+        [
+            pred_joints_torch,
+            torch.ones(pred_joints_torch.shape[0], pred_joints_torch.shape[1], 1,
+                       device=pred_joints_torch.device, dtype=pred_joints_torch.dtype)
+        ],
+        dim=-1
+    )  # (L, J, 4)
+
+    # Transform vertices and joints to world-global frame
+    verts_world_h = np.einsum('ij, l v j -> l v i', T_c2w.cpu(), verts_incam_h.cpu())  # (L, V, 4)
+    verts_world = verts_world_h[:, :, :3]  # (L, V, 3)
+    joints_world_h = np.einsum('ij, l p j -> l p i', T_c2w.cpu(), joints_incam_h.cpu())  # (L, J, 4)
+    joints_world = joints_world_h[:, :, :3]  # (L, J, 3)
+
+    # Convert back to torch tensors
+    verts_glob = torch.from_numpy(verts_world).to(verts_incam.device).float()  # (L, V, 3)
+    joints_glob = torch.from_numpy(joints_world).to(joints_incam.device).float()  # (L, J, 3)
+    # ------------------------------------------------------------------------------------------------------
+
+    if cfg.verbose:
+        Log.info(f"[Render Global] Camera {cam_name} - Predicted vertices in world-global frame: {verts_glob.shape}")
+        Log.info(f"[Render Global] Camera {cam_name} - Predicted joints in world-global frame: {joints_glob.shape}")
+
+        # --- Plot joints_glob in 3D using matplotlib ---
+        def plot_vertices_3d(joints, frame_idx=0, title="3D Joints"):  # joints: (L, J, 3)
+            js = joints[frame_idx].cpu().numpy() if hasattr(joints, 'cpu') else joints[frame_idx]
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection='3d')
+            ax.scatter(js[:, 0], js[:, 1], js[:, 2], c='r', marker='o')
+            # for i, (x, y, z) in enumerate(js):
+            #     ax.text(x, y, z, str(i), fontsize=8)
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            ax.set_title(title)
+            plt.draw()
+
+        global_plot_idx = 100  # Change to desired frame index
+        plot_vertices_3d(verts_incam, frame_idx=global_plot_idx, title=f"[Cam] 3D Joints (frame {global_plot_idx})")
+        plot_vertices_3d(verts_glob, frame_idx=global_plot_idx, title=f"[World] 3D Joints (frame {global_plot_idx})")
+        plt.show()
+
+    # -- rendering code -- #
+    video_path = cfg.video_path
+    _, width, height = get_video_lwh(video_path)
+    K = torch.load(cfg.paths.intrinsics)
+    if isinstance(K, np.ndarray):
+        K = torch.from_numpy(K).float()
+
+    # renderer
+    renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K)
+
+    # choose camera view to render
+    R = torch.from_numpy(T_w2c[:3, :3]).float().cuda()  # (3, 3)
+    T = torch.from_numpy(T_w2c[:3, 3]).float().cuda()  # (3,)
+    renderer.create_camera(R, T)  # Set the camera pose
+
+    # Use as img the current frame from the video
+    writer = get_writer(global_video_path, fps=cfg.fps, crf=CRF)
+    video_reader = get_video_reader(video_path)
+
+    for i, img in tqdm(enumerate(video_reader), desc=f"Rendering Global Multicam"):
+        # Render the mesh for the current frame
+        img = renderer.render_mesh(verts_glob[i], background=img, colors=[0.8, 0.6, 0.2])
+
+        # Draw the table rectangle
+        img = render_table_rectangle(K, T_w2c, img)
+
+        # Draw world coordinate axes at the origin (length=0.5m)
+        img = draw_axes_on_image(img, K, T_w2c, length=0.5)
+
+        writer.write_frame(img)
+
+    writer.close()
+
+
+def render_table_rectangle(K, T_w2c, img, color=(0, 255, 255), thickness=2):
+    """
+    Draws the table rectangle defined by the first 4 points in cfg.reference_object_keypoints_3D
+    onto the given image using the provided camera intrinsics and extrinsics.
+    """
+    # Ensure K is a numpy array
+    if isinstance(K, torch.Tensor):
+        K = K.cpu().numpy().astype(np.float64)
+
+    # Load reference keypoints (scene peculiar points) and extract unique values across cameras
+    _, ref_kpts_3D_dict = load_calibration_points_from_csv(
+        cfg.preprocess_dir,
+        csv_filename=cfg.reference_object_kpts_filename,
+    )
+    ref_3D_kpts = np.vstack(list(ref_kpts_3D_dict.values()))
+    _, ref_3D_kpts_idx = np.unique(ref_3D_kpts, axis=0, return_index=True)
+    ref_3D_kpts = ref_3D_kpts[sorted(ref_3D_kpts_idx)]
+
+    # Get the first 4 table corners (Nx3)
+    pts_w = np.array(ref_3D_kpts[:4], dtype=np.float32) # (4, 3)
+    
+    # Extract rotation matrix (3x3) and translation vector (3,)
+    R = T_w2c[:3, :3]
+    t = T_w2c[:3, 3]
+
+    # Convert rotation matrix to Rodrigues vector
+    rvec, _ = cv2.Rodrigues(R)
+    tvec = t.reshape(3, 1)
+    
+    # Project to image
+    pts_img, _ = cv2.projectPoints(pts_w, rvec, tvec, K, distCoeffs=np.zeros(4))
+    pts_img = pts_img.squeeze().astype(int)
+
+    # Draw rectangle (connect corners)
+    for i in range(4):
+        pt1 = tuple(pts_img[i])
+        pt2 = tuple(pts_img[(i + 1) % 4])
+        img = cv2.line(img, pt1, pt2, color, thickness)
+
+    return img
+
+
+def draw_axes_on_image(img, K, T_w2c, length=0.5):
+    """
+    Draws XYZ axes at the world origin on the image.
+    img: (H, W, 3) numpy array
+    K: (3, 3) camera intrinsics
+    T_w2c: (4, 4) world-to-camera extrinsic (identity for world origin)
+    length: axis length in meters
+    """
+    if isinstance(K, torch.Tensor):
+        K = K.cpu().numpy().astype(np.float64)
+
+    # World origin and axes endpoints in world frame
+    origin = np.array([0, 0, 0])
+    x_axis = np.array([length, 0, 0])
+    y_axis = np.array([0, length, 0])
+    z_axis = np.array([0, 0, length])
+    pts_w = np.stack([origin, x_axis, y_axis, z_axis], axis=0).T  # (4, 3)
+    
+    # Extract rotation matrix (3x3) and translation vector (3,)
+    R = T_w2c[:3, :3]
+    t = T_w2c[:3, 3]
+
+    # Convert rotation matrix to Rodrigues vector
+    rvec, _ = cv2.Rodrigues(R)
+    tvec = t.reshape(3, 1)
+
+    # Project to image
+    pts_img, _ = cv2.projectPoints(pts_w, rvec, tvec, K, distCoeffs=np.zeros(4))
+    pts_img = pts_img.squeeze().astype(int)
+    
+    # Draw axes
+    img = cv2.line(img, tuple(pts_img[0]), tuple(pts_img[1]), (255, 0, 0), 3)  # X - Red
+    img = cv2.line(img, tuple(pts_img[0]), tuple(pts_img[2]), (0, 255, 0), 3)  # Y - Green
+    img = cv2.line(img, tuple(pts_img[0]), tuple(pts_img[3]), (0, 0, 255), 3)  # Z - Blue
+    
+    return img
+
+
 if __name__ == "__main__":
     cfg = parse_args_to_cfg()
     paths = cfg.paths
     Log.info(f"[GPU]: {torch.cuda.get_device_name()}")
     Log.info(f'[GPU]: {torch.cuda.get_device_properties("cuda")}')
+
+    # ===== Camera calibration ===== #
+    calibrate_cameras(cfg)
 
     # ===== Preprocess and save to disk ===== #
     run_preprocess(cfg)
@@ -609,7 +864,7 @@ if __name__ == "__main__":
                 tic = Log.sync_time()
                 pred = model.predict(cam_data, static_cam=cfg.static_cam)
                 pred = detach_to_cpu(pred)
-                data_time = cam_data["length"] / 30
+                data_time = cam_data["length"] / cfg.fps # 30
                 Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
                 torch.save(pred, hmr4d_result_path)
 
@@ -628,10 +883,11 @@ if __name__ == "__main__":
             cfg_cam.video_path = str(Path(cfg.video_path).with_stem(f"{Path(cfg.video_path).stem}_{cam_name}"))
 
             render_incam(cfg_cam)
-            render_global(cfg_cam)
+            render_global_multicam(cfg_cam, cam_name)
             if not Path(cfg_cam.paths.incam_global_horiz_video).exists():
                 Log.info(f"[Merge Videos] for {cam_name}")
                 merge_videos_horizontal([cfg_cam.paths.incam_video, cfg_cam.paths.global_video], cfg_cam.paths.incam_global_horiz_video)
+
     else:
         # Single camera or flat folder
         if not Path(paths.hmr4d_results).exists():

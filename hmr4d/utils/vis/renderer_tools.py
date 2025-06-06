@@ -167,6 +167,7 @@ def checkerboard_geometry(
     up="y",
     c1=0.0,
     c2=0.0,
+    offset=0.0
 ):
     assert up == "y" or up == "z"
     color0 = np.array(color0 + [alpha])
@@ -186,11 +187,13 @@ def checkerboard_geometry(
             if up == "y":
                 cur_verts = np.stack([us, zs, vs], axis=-1)  # (4, 3)
                 cur_verts[:, 0] += c1
+                cur_verts[:, 1] += offset
                 cur_verts[:, 2] += c2
             else:
                 cur_verts = np.stack([us, vs, zs], axis=-1)  # (4, 3)
                 cur_verts[:, 0] += c1
                 cur_verts[:, 1] += c2
+                cur_verts[:, 2] += offset
 
             cur_faces = np.array([[0, 1, 3], [1, 2, 3], [0, 3, 1], [1, 3, 2]], dtype=np.int64)
             cur_faces += 4 * (i * num_cols + j)  # the number of previously added verts

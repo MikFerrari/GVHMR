@@ -19,42 +19,26 @@ ckpt_path: inputs/checkpoints/gvhmr/gvhmr_siga24_release.ckpt
 #          global setting          #
 # ================================ #
 
-video_name: buildbot_example_frames_cam3
+video_name: buildbot_example_frames
 output_root: outputs/demo
 output_dir: "${output_root}/${video_name}"
 preprocess_dir: ${output_dir}/preprocess
 video_path: "${preprocess_dir}/0_input_video.mp4"
-# frames_path: ???
-main_view_cam: 'cam_3'
-reference_object_keypoints_3D: # [meters]
- - [0.0, 0.0, 0.0]  # the table corners in this case (ordered clockwise from top left)
- - [1.8, 0.0, 0.0]
- - [1.8, 1.0, 0.0]
- - [0.0, 1.0, 0.0]
-reference_object_keypoints: # [pixels]
-# the table corners in this case (ordered clockwise from top left)
-  cam_1:
-    - [133,  30]
-    - [533,  28]
-    - [513, 295]
-    - [155, 298]
-  cam_2:
-    - [309, 278]
-    - [599, 361]
-    - [425, 516]
-    - [130, 337]
-  cam_3:
-    - [581, 263]
-    - [614, 484]
-    - [190, 415]
-    - [350, 257]
+reference_object_kpts_filename: "reference_object_keypoints.csv"
+calibration_filename: "calibration_points.csv"
+calibration_valid_filename: "calibration_points_valid.csv"
+bundle_adjustment_filename: "reference_points_bundleAdj.csv"
 
 # Options
 static_cam: False
-verbose: False
+verbose: True
 use_dpvo: False
-f_mm: 1.98 #null  # focal length of fullframe camera in mm
+f_mm: 35  # focal length of fullframe camera in mm
 fps: 15
+start_idx_images_to_load: 50
+end_idx_images_to_load: 200
+augment_calib_with_ref_kpts: False # whether to use also reference object keypoints for camera calibration
+perform_bundle_adjustment: False # whether to perform bundle adjustment on the camera poses
 
 paths:
   bbx: ${preprocess_dir}/bbx.pt
@@ -67,3 +51,5 @@ paths:
   global_video: ${output_dir}/2_global.mp4
   incam_global_horiz_video: ${output_dir}/${video_name}_3_incam_global_horiz.mp4
   slam: ${preprocess_dir}/slam_results.pt
+  extrinsics: ${output_dir}/extrinsics.pt
+  intrinsics: ${output_dir}/intrinsics.pt

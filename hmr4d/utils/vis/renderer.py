@@ -174,6 +174,13 @@ class Renderer:
         v, f, vc = v.to(device), f.to(device), vc.to(device)
         self.ground_geometry = [v, f, vc]
 
+    def set_ground_with_offset(self, length, center_1, center_2, up="y", offset=0.0):
+        device = self.device
+        length, center_1, center_2 = map(float, (length, center_1, center_2))
+        v, f, vc, fc = map(torch.from_numpy, checkerboard_geometry(length=length, c1=center_1, c2=center_2, up=up, offset=offset))
+        v, f, vc = v.to(device), f.to(device), vc.to(device)
+        self.ground_geometry = [v, f, vc]
+
     def update_bbox(self, x3d, scale=2.0, mask=None):
         """Update bbox of cameras from the given 3d points
 

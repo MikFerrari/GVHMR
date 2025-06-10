@@ -178,6 +178,8 @@ def validate_and_plot_calibration_scene(
     calib_2D_kpts_dict,
     calib_valid_3D_kpts_dict,
     calib_valid_2D_kpts_dict,
+    ref_3D_kpts_dict,
+    ref_2D_kpts_dict,
     img_wh=(640, 480),
     connect_indices=None
 ):
@@ -245,34 +247,38 @@ def validate_and_plot_calibration_scene(
     plt.draw()
 
     # Plot 2D calibration points for each camera and the 2D reprojection of 3D points
-    for cam_name, pts_2D in calib_2D_kpts_dict.items():        
-        # Reproject 3D points to 2D
-        projected_2D, _, errors = project_3d_points_to_2d(
-            calib_3D_kpts_dict[cam_name], # 3D points
-            camera_matrices[cam_name][0], # R
-            camera_matrices[cam_name][1], # t
-            camera_matrices[cam_name][2], # K
-            pts_2D_gt=pts_2D,
-            return_error=True
-        )
-
-        print("Calibration Points")
-        print_reprojection_error_report(pts_2D, projected_2D, errors, cam_name)
-
-        # Plot 2D GT points and reprojected 2D points
-        plot_2d_keypoints_with_indices(
-            pts_2D, projected_2D, colors[cam_name],
-            figsize=(12, 10),
-            img_wh=img_wh,
-            cam_name=cam_name,
-            title="2D Points vs 3D Reprojected Points - Calibration"
-        )
+    plot_2d_points_and_reprojection(
+        calib_2D_kpts_dict, calib_3D_kpts_dict, camera_matrices, colors, img_wh, "Calibration"
+    )
 
     # Plot 2D validation points for each camera and the 2D reprojection of 3D points
-    for cam_name, pts_2D in calib_valid_2D_kpts_dict.items():
+    plot_2d_points_and_reprojection(
+        calib_valid_2D_kpts_dict, calib_valid_3D_kpts_dict, camera_matrices, colors, img_wh, "Validation"
+    )
+
+    # Plot 2D reference points for each camera and the 2D reprojection of 3D points
+    plot_2d_points_and_reprojection(
+        ref_2D_kpts_dict, ref_3D_kpts_dict, camera_matrices, colors, img_wh, "Reference"
+    )
+
+    plt.show()
+
+
+def plot_2d_points_and_reprojection(
+    kpts_2D_dict,
+    kpts_3D_dict,
+    camera_matrices,
+    colors,
+    img_wh,
+    title_prefix
+):
+    """
+    Plot 2D keypoints and their 3D reprojection for each camera.
+    """
+    for cam_name, pts_2D in kpts_2D_dict.items():
         # Reproject 3D points to 2D
         projected_2D, _, errors = project_3d_points_to_2d(
-            calib_valid_3D_kpts_dict[cam_name],  # 3D points
+            kpts_3D_dict[cam_name],  # 3D points
             camera_matrices[cam_name][0],  # R
             camera_matrices[cam_name][1],  # t
             camera_matrices[cam_name][2],  # K
@@ -280,7 +286,7 @@ def validate_and_plot_calibration_scene(
             return_error=True
         )
 
-        print("Validation Points")
+        print(title_prefix)
         print_reprojection_error_report(pts_2D, projected_2D, errors, cam_name)
 
         # Plot 2D GT points and reprojected 2D points
@@ -289,10 +295,8 @@ def validate_and_plot_calibration_scene(
             figsize=(12, 10),
             img_wh=img_wh,
             cam_name=cam_name,
-            title="2D Points vs 3D Reprojected Points - Validation"
+            title=f"2D Points vs 3D Reprojected Points - {title_prefix}"
         )
-
-    plt.show()
 
 
 def plot_2d_keypoints_with_indices(
@@ -477,6 +481,8 @@ def load_calibration_points_from_csv(frames_dir, csv_filename="calibration_point
 def calibrate_cameras_with_ref_kpts(
         kpts_2D_dict,
         kpts_3D_dict,
+        ref_2D_dict,
+        ref_3D_dict,
         camera_matrix,
         dist_coeffs,
         debug=False
@@ -495,10 +501,18 @@ def calibrate_cameras_with_ref_kpts(
         valid_mask = ~np.any(np.equal(image_points, -1), axis=1)
         valid_image_points = image_points[valid_mask]
         valid_object_3D_points = kpts_3D_dict[cam_name][valid_mask]
-
         if len(valid_image_points) < 4:
             raise ValueError(f"Insufficient valid points for {cam_name}: "
                            f"need ≥4, got {len(valid_image_points)}")
+        
+        # Exclude the reference points that are [-1, -1] and the corresponding 3D points
+        ref_image_points = np.array(ref_2D_dict[cam_name], dtype=np.float32)
+        ref_valid_mask = ~np.any(np.equal(ref_image_points, -1), axis=1)
+        ref_valid_image_points = ref_image_points[ref_valid_mask]
+        ref_valid_object_3D_points = ref_3D_dict[cam_name][ref_valid_mask]
+        if len(ref_valid_image_points) < 4:
+            raise ValueError(f"Insufficient reference points for {cam_name}: "
+                           f"need ≥4, got {len(ref_valid_image_points)}")
 
         # Solve PnP for this camera
         success, rvec, tvec = cv2.solvePnP(
@@ -507,9 +521,26 @@ def calibrate_cameras_with_ref_kpts(
             camera_matrix,
             dist_coeffs
         )
+        # success, rvec, tvec, inliers = cv2.solvePnPRansac(
+        #     valid_object_3D_points,
+        #     valid_image_points,
+        #     camera_matrix,
+        #     dist_coeffs,
+        #     flags=cv2.SOLVEPNP_ITERATIVE
+        # )
         if not success:
             raise RuntimeError(f"Failed to solvePnP for camera {cam_name}. Check input data.")
         
+        rvec, tvec = cv2.solvePnPRefineVVS(
+            ref_valid_object_3D_points,
+            ref_valid_image_points,
+            camera_matrix,
+            dist_coeffs,
+            rvec,
+            tvec
+        )
+        print(f"[Calibration] Refined pose for {cam_name} using solvePnPRefineVVS.")
+
         # Build extrinsic matrix [R|t] that transforms world -> camera
         R, _ = cv2.Rodrigues(rvec)
         extrinsic = np.eye(4)

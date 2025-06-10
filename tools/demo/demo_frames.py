@@ -33,6 +33,7 @@ from hmr4d.utils.geo_transform import apply_T_on_points, compute_T_ayfz2ay
 from einops import einsum, rearrange
 
 from camera_calibration_utils import *
+from object_tracking_utils import *
 import matplotlib.pyplot as plt
 
 
@@ -119,27 +120,32 @@ def parse_args_to_cfg():
 
     # Copy calibration points to preprocess dir
     Log.info(f"[Copy Calibration Points] {frames_dir} -> {cfg.preprocess_dir}")
-    copy_calibration_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.calibration_filename)
-    copy_calibration_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.calibration_valid_filename)
-    copy_calibration_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.reference_object_kpts_filename)
-    copy_calibration_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.bundle_adjustment_filename)
+    copy_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.calibration_filename)
+    copy_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.calibration_valid_filename)
+    copy_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.reference_object_kpts_filename)
+    copy_csv_to_preprocess(frames_dir, cfg.preprocess_dir, cfg.bundle_adjustment_filename)
+
+    # Copy object bounding boxes to preprocess dir
+    Log.info(f"[Copy Object BBoxes] {frames_dir} -> {cfg.preprocess_dir}")
+    for cam_name in frames_paths_dict.keys():
+        copy_csv_to_preprocess(frames_dir, cfg.preprocess_dir, f"{cam_name}_bboxes.csv")
 
     return cfg
 
 
-def copy_calibration_csv_to_preprocess(frames_dir, preprocess_dir, csv_filename):
+def copy_csv_to_preprocess(input_dir, preprocess_dir, csv_filename):
     """
-    Copy a calibration CSV file from frames_dir to preprocess_dir if it exists and not already copied.
+    Copy a CSV file from input_dir to preprocess_dir if it exists and not already copied.
     """
-    calibration_csv_path = Path(frames_dir) / csv_filename
-    out_calibration_csv_path = Path(preprocess_dir) / csv_filename
-    if calibration_csv_path.exists():
-        if not out_calibration_csv_path.exists():
-            Log.info(f"Copying calibration points from {calibration_csv_path} to {out_calibration_csv_path}")
-            df = pd.read_csv(calibration_csv_path)
-            df.to_csv(out_calibration_csv_path, index=False)
+    csv_path = Path(input_dir) / csv_filename
+    out_csv_path = Path(preprocess_dir) / csv_filename
+    if csv_path.exists():
+        if not out_csv_path.exists():
+            Log.info(f"Copying csv file from {csv_path} to {out_csv_path}")
+            df = pd.read_csv(csv_path)
+            df.to_csv(out_csv_path, index=False)
     else:
-        Log.error(f"Calibration CSV file not found: {calibration_csv_path}. ")
+        Log.error(f"CSV file not found: {csv_path}. ")
 
 
 @torch.no_grad()
@@ -212,6 +218,8 @@ def calibrate_cameras(cfg):
     extrinsics = calibrate_cameras_with_ref_kpts(
         calib_kpts_2D_dict, 
         calib_kpts_3D_dict,
+        ref_kpts_2D_dict,
+        ref_kpts_3D_dict,
         camera_matrix,
         dist_coeffs,
         debug=verbose
@@ -226,8 +234,10 @@ def calibrate_cameras(cfg):
             ref_3D_kpts,
             calib_kpts_3D_dict,
             calib_kpts_2D_dict,
-            ref_kpts_3D_dict, #calib_valid_kpts_3D_dict,
-            ref_kpts_2D_dict, #calib_valid_kpts_2D_dict,
+            calib_valid_kpts_3D_dict,
+            calib_valid_kpts_2D_dict,
+            ref_kpts_3D_dict,
+            ref_kpts_2D_dict,
             connect_indices=[0,1,2,3],  # Connect the corners of the table
         )
 
@@ -256,6 +266,8 @@ def calibrate_cameras(cfg):
                 calib_kpts_2D_dict,
                 calib_valid_kpts_3D_dict,
                 calib_valid_kpts_2D_dict,
+                ref_kpts_3D_dict,
+                ref_kpts_2D_dict,
                 connect_indices=[0,1,2,3],  # Connect the corners of the table
             )
     
@@ -847,6 +859,9 @@ if __name__ == "__main__":
     # ===== Camera calibration ===== #
     calibrate_cameras(cfg)
 
+    # ===== Object bounding box (bbx) triangulation ===== #
+    # obj_bbx_2D_dict, obj_bbx_3D = triangulate_object_bbx(cfg)
+
     # ===== Preprocess and save to disk ===== #
     run_preprocess(cfg)
     data = load_data_dict(cfg, video_mode=False)  # False for image batch processing
@@ -884,6 +899,8 @@ if __name__ == "__main__":
 
             render_incam(cfg_cam)
             render_global_multicam(cfg_cam, cam_name)
+            # render_incam_multicam(cfg_cam, cam_name, obj_bbx_2D_dict[cam_name])
+            # render_global_multicam(cfg_cam, cam_name, obj_bbx_3D)
             if not Path(cfg_cam.paths.incam_global_horiz_video).exists():
                 Log.info(f"[Merge Videos] for {cam_name}")
                 merge_videos_horizontal([cfg_cam.paths.incam_video, cfg_cam.paths.global_video], cfg_cam.paths.incam_global_horiz_video)

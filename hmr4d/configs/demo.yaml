@@ -20,10 +20,12 @@ ckpt_path: inputs/checkpoints/gvhmr/gvhmr_siga24_release.ckpt
 # ================================ #
 
 video_name: buildbot_example_frames
-output_root: outputs/demo
-output_dir: "${output_root}/${video_name}"
 preprocess_dir: ${output_dir}/preprocess
 video_path: "${preprocess_dir}/0_input_video.mp4"
+
+output_root: outputs/demo
+output_dir: "${output_root}/${video_name}"
+
 reference_object_kpts_filename: "reference_object_keypoints.csv"
 calibration_filename: "calibration_points.csv"
 calibration_valid_filename: "calibration_points_valid.csv"
@@ -35,9 +37,11 @@ verbose: True
 use_dpvo: False
 f_mm: 35  # focal length of fullframe camera in mm
 fps: 15
-start_idx_images_to_load: 50
+idx_first_image_in_folder: 500 # index of the first image in the folder to start processing
+start_idx_images_to_load: 50 # index of the first image to load (so, we are effectively loading images
+                             # from idx_first_image_in_folder + start_idx_images_to_load)
 end_idx_images_to_load: 200
-augment_calib_with_ref_kpts: False # whether to use also reference object keypoints for camera calibration
+augment_calib_with_ref_kpts: True # whether to use also reference object keypoints for camera calibration
 perform_bundle_adjustment: False # whether to perform bundle adjustment on the camera poses
 
 paths:
